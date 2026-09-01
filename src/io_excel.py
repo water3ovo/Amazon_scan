@@ -30,6 +30,7 @@ OWN_HEADERS = [
     "日期", "国家", "Portfolio", "产品", "ASIN", "URL", "产品名称", "配置", "颜色",
     "价格原始", "价格数值", "划线价格", "购买框归属", "库存预警", "配送信息", "配送>10天",
     "评分", "评论数", "BSR一级", "BSR二级", "异常标注", "优惠标签", "Amazon精选", "备注",
+    "购买框状态",
 ]
 COMP_HEADERS = [
     "日期", "国家", "品牌", "产品", "ASIN", "URL", "产品名称", "配置", "颜色",
@@ -38,7 +39,7 @@ COMP_HEADERS = [
 ]
 TECH_HEADERS = [
     "扫描时间", "国家", "类型", "ASIN", "URL", "scan_status", "error_reason", "attempts",
-    "page_state", "stock_status", "购买框归属", "配送方", "页面标题", "debug_screenshot",
+    "page_state", "stock_status", "购买框状态", "购买框归属", "配送方", "页面标题", "debug_screenshot",
 ]
 
 
@@ -146,6 +147,7 @@ def _own_row(result: ScanResult):
         t.configuration, t.color, s.price_raw, s.price_value, s.list_price, s.buybox_seller,
         s.stock_text, s.delivery_text, s.delivery_over_10_days, s.rating, s.reviews,
         s.bsr_primary, s.bsr_secondary, result.anomaly, s.deal_tag, s.amazon_choice, note,
+        s.purchase_box_status,
     ]
 
 
@@ -181,8 +183,8 @@ def write_results(path: str | Path, results: list[ScanResult], started_at: datet
         ws_tech.append([
             datetime.now(), result.target.country, result.target.product_type, result.target.asin,
             result.target.url, result.scan_status, result.error_reason, result.attempts,
-            result.snapshot.page_state, result.snapshot.stock_status, result.snapshot.buybox_seller,
-            result.snapshot.ships_from, result.snapshot.page_title, result.debug_screenshot,
+            result.snapshot.page_state, result.snapshot.stock_status, result.snapshot.purchase_box_status,
+            result.snapshot.buybox_seller, result.snapshot.ships_from, result.snapshot.page_title, result.debug_screenshot,
         ])
 
     for ws in (ws_own, ws_comp):
@@ -191,7 +193,7 @@ def write_results(path: str | Path, results: list[ScanResult], started_at: datet
     for cell in ws_tech["A"][1:]:
         cell.number_format = "yyyy-mm-dd hh:mm:ss"
 
-    _style_sheet(ws_own, {1: 12, 2: 9, 3: 28, 4: 22, 5: 14, 6: 42, 7: 42, 8: 14, 9: 14, 10: 16, 11: 12, 12: 16, 13: 20, 14: 24, 15: 36, 21: 22, 24: 30})
+    _style_sheet(ws_own, {1: 12, 2: 9, 3: 28, 4: 22, 5: 14, 6: 42, 7: 42, 8: 14, 9: 14, 10: 16, 11: 12, 12: 16, 13: 20, 14: 24, 15: 36, 21: 22, 24: 30, 25: 18})
     _style_sheet(ws_comp, {1: 12, 2: 9, 3: 18, 4: 22, 5: 14, 6: 42, 7: 42, 8: 14, 9: 14, 10: 16, 11: 12, 12: 16, 13: 20, 14: 24, 15: 36})
     _style_sheet(ws_tech, {1: 20, 2: 9, 3: 10, 4: 14, 5: 42, 6: 12, 7: 35, 8: 10, 9: 20, 10: 18, 11: 20, 12: 50, 13: 50})
 

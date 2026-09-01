@@ -32,13 +32,14 @@ def test_anomaly():
     target = ScanTarget("AE", "本品", "P", "Phone", "B0GGQP6FQ3")
     snap = ProductSnapshot(
         buybox_seller="Other Seller",
+        purchase_box_status="FOUND",
         stock_status="LOW_STOCK",
         delivery_over_10_days="Yes",
     )
     result = build_anomaly(target, snap, ["Amazon.ae"])
     assert "库存紧张" in result
-    assert "配送>10天" in result
-    assert "购买框异常" in result
+    assert "配送时间大于10天" in result
+    assert "buy box被第三方抢占（Other Seller）" in result
 
 
 def test_purchase_box_label_variants():
@@ -63,5 +64,45 @@ def test_purchase_box_label_variants():
 
 def test_missing_purchase_box_is_not_business_anomaly():
     target = ScanTarget("AE", "本品", "P", "Phone", "B0GGQP6FQ3")
-    snap = ProductSnapshot(buybox_seller="", stock_status="IN_STOCK")
-    assert "购买框异常" not in build_anomaly(target, snap, ["Amazon.ae"])
+    snap = ProductSnapshot(
+        buybox_seller="", purchase_box_status="PARSE_FAILED", stock_status="IN_STOCK"
+    )
+    assert "buy box丢失" not in build_anomaly(target, snap, ["Amazon.ae"])
+
+
+def test_purchase_box_status_signals():
+    assert AmazonParser._classify_purchase_box(
+        seller="Amazon.ae", stock_status="IN_STOCK", price_value=2699.0,
+        has_checkout_controls=True, body_text="In Stock"
+    ) == "FOUND"
+
+    assert AmazonParser._classify_purchase_box(
+        seller="", stock_status="UNAVAILABLE", price_value=None,
+        has_checkout_controls=False, body_text="Currently unavailable"
+    ) == "NO_BUYBOX"
+
+    assert AmazonParser._classify_purchase_box(
+        seller="", stock_status="IN_STOCK", price_value=2699.0,
+        has_checkout_controls=True, body_text="In Stock"
+    ) == "PARSE_FAILED"
+
+    # No price alone must not be treated as proof of Buy Box loss.
+    assert AmazonParser._classify_purchase_box(
+        seller="", stock_status="UNKNOWN", price_value=None,
+        has_checkout_controls=False, body_text="Product detail page"
+    ) == "PARSE_FAILED"
+
+
+def test_purchase_box_loss_and_specific_seller_anomaly():
+    target = ScanTarget("AE", "本品", "P", "Phone", "B0GGQP6FQ3")
+    lost = ProductSnapshot(purchase_box_status="NO_BUYBOX", stock_status="UNAVAILABLE")
+    assert "buy box丢失" in build_anomaly(target, lost, ["Amazon.ae"])
+
+    third_party = ProductSnapshot(
+        buybox_seller="Tell Tech Trading FZ-LLC",
+        purchase_box_status="FOUND",
+        stock_status="IN_STOCK",
+    )
+    assert "buy box被第三方抢占（Tell Tech Trading FZ-LLC）" in build_anomaly(
+        target, third_party, ["Amazon.ae"]
+    )

@@ -25,6 +25,7 @@ class ProductSnapshot:
     price_value: Optional[float] = None
     list_price: str = ""
     buybox_seller: str = ""
+    purchase_box_status: str = "UNKNOWN"
     ships_from: str = ""
     stock_text: str = ""
     stock_status: str = "UNKNOWN"

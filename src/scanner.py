@@ -57,12 +57,16 @@ class Scanner:
                     screenshot = browser.save_screenshot(f"{target.asin}_not_found_{timestamp_slug()}")
                     return ScanResult(target, snapshot, "OK", "", attempt, screenshot, anomaly)
 
-                core_missing = not snapshot.product_name or (snapshot.price_value is None and not snapshot.stock_text)
-                purchase_box_missing = (
-                    target.product_type == "本品"
-                    and "purchase_box_owner_missing" in snapshot.warnings
+                core_missing = not snapshot.product_name or (
+                    snapshot.price_value is None
+                    and not snapshot.stock_text
+                    and snapshot.purchase_box_status != "NO_BUYBOX"
                 )
-                status = "PARTIAL" if (core_missing or purchase_box_missing) else "OK"
+                purchase_box_parse_failed = (
+                    target.product_type == "本品"
+                    and snapshot.purchase_box_status == "PARSE_FAILED"
+                )
+                status = "PARTIAL" if (core_missing or purchase_box_parse_failed) else "OK"
                 reason = ",".join(snapshot.warnings) if status == "PARTIAL" else ""
                 anomaly = build_anomaly(target, snapshot, country_cfg.get("expected_seller_keywords", []))
 

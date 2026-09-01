@@ -181,6 +181,71 @@ class AmazonParser:
                     ships_from = clean_text(match.group(1))
         return seller, ships_from
 
+    @staticmethod
+    def _classify_purchase_box(
+        seller: str,
+        stock_status: str,
+        price_value: float | None,
+        has_checkout_controls: bool,
+        body_text: str,
+    ) -> str:
+        """Classify purchase-box state without treating a missing price as proof."""
+        if clean_text(seller):
+            return "FOUND"
+
+        body = clean_text(body_text).lower()
+        no_buybox_markers = [
+            "see all buying options",
+            "see all buying choices",
+            "no featured offers available",
+            "currently unavailable",
+            "temporarily out of stock",
+            "currently out of stock",
+            "عرض جميع خيارات الشراء",
+            "غير متوفر حالياً",
+            "غير متوفر حاليا",
+            "غير متوفر حاليًا",
+        ]
+        if stock_status in {"OUT_OF_STOCK", "UNAVAILABLE"}:
+            return "NO_BUYBOX"
+        if any(marker in body for marker in no_buybox_markers):
+            return "NO_BUYBOX"
+
+        if has_checkout_controls or price_value is not None or stock_status in {"IN_STOCK", "LOW_STOCK"}:
+            return "PARSE_FAILED"
+
+        # Missing price alone is ambiguous: DOM changes, an unselected variant,
+        # geo state, or a parser miss can also make the price disappear.
+        return "PARSE_FAILED"
+
+    def purchase_box_status(
+        self,
+        seller: str,
+        stock_status: str,
+        price_value: float | None,
+    ) -> str:
+        checkout_selectors = [
+            (By.ID, "add-to-cart-button"),
+            (By.ID, "buy-now-button"),
+            (By.CSS_SELECTOR, "input[name='submit.add-to-cart']"),
+            (By.CSS_SELECTOR, "input[name='submit.buy-now']"),
+        ]
+        has_checkout_controls = False
+        for by, selector in checkout_selectors:
+            try:
+                if self.driver.find_elements(by, selector):
+                    has_checkout_controls = True
+                    break
+            except Exception:
+                continue
+        return self._classify_purchase_box(
+            seller=seller,
+            stock_status=stock_status,
+            price_value=price_value,
+            has_checkout_controls=has_checkout_controls,
+            body_text=self._body_text(),
+        )
+
     def stock(self) -> tuple[str, str]:
         selectors = [
             (By.ID, "availability"),
@@ -314,6 +379,9 @@ class AmazonParser:
         snapshot.list_price = self.list_price()
         snapshot.buybox_seller, snapshot.ships_from = self.merchant()
         snapshot.stock_text, snapshot.stock_status = self.stock()
+        snapshot.purchase_box_status = self.purchase_box_status(
+            snapshot.buybox_seller, snapshot.stock_status, snapshot.price_value
+        )
         snapshot.delivery_text, snapshot.delivery_over_10_days = self.delivery()
         snapshot.rating, snapshot.reviews = self.rating_reviews()
         snapshot.bsr_primary, snapshot.bsr_secondary = self.bsr()
@@ -325,6 +393,6 @@ class AmazonParser:
             snapshot.warnings.append("price_missing")
         if not snapshot.stock_text:
             snapshot.warnings.append("stock_text_missing")
-        if snapshot.stock_status in {"IN_STOCK", "LOW_STOCK"} and not snapshot.buybox_seller:
-            snapshot.warnings.append("purchase_box_owner_missing")
+        if snapshot.purchase_box_status == "PARSE_FAILED":
+            snapshot.warnings.append("purchase_box_parse_failed")
         return snapshot
