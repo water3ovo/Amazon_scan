@@ -1,0 +1,2 @@
+selenium>=4.35,<5
+openpyxl>=3.1,<4

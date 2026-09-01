@@ -1,0 +1,12 @@
+{
+  "AE": {
+    "domain": "amazon.ae",
+    "currency": "AED",
+    "expected_seller_keywords": ["amazon.ae", "amazon ae"]
+  },
+  "SA": {
+    "domain": "amazon.sa",
+    "currency": "SAR",
+    "expected_seller_keywords": ["amazon.sa", "amazon sa"]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "browser": {
+    "headless": false,
+    "page_load_timeout_seconds": 25,
+    "element_wait_seconds": 5,
+    "min_delay_seconds": 2.0,
+    "max_delay_seconds": 4.0,
+    "max_retries": 2,
+    "save_screenshot_on_failure": true,
+    "save_screenshot_on_anomaly": false
+  },
+  "scan": {
+    "filter_active_products": true,
+    "checkpoint_every": 10
+  }
+}
