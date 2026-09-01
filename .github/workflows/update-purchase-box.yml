@@ -1,0 +1,203 @@
+name: Update purchase box parsing
+
+on:
+  push:
+    paths:
+      - ".github/workflows/update-purchase-box.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply purchase box parser update
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          # 1) Amazon parser: support AE/SA purchase-box layouts and old merchant selector.
+          p = Path("src/amazon_parser.py")
+          s = p.read_text(encoding="utf-8")
+          start = s.index("    @staticmethod\n    def _parse_labeled_lines")
+          end = s.index("\n    def stock(self)", start)
+          new_block = '''    @staticmethod
+    def _parse_labeled_lines(text: str) -> tuple[str, str]:
+        """Parse Amazon Buy Box labels into purchase-box owner and fulfiller.
+
+        AE/SA currently use several layouts, including ``Shipper / Seller``,
+        ``Sold by``, ``Delivered by`` and ``Ships from``. A label/value pair may
+        be split across two lines or rendered inline on the same line.
+        """
+        lines = [clean_text(x) for x in str(text).splitlines() if clean_text(x)]
+        seller_labels = [
+            "shipper / seller", "shipper/seller", "sold by", "seller",
+            "يُباع بواسطة", "يباع بواسطة", "البائع",
+        ]
+        ship_labels = [
+            "delivered by", "ships from", "dispatches from", "shipped from",
+            "الشحن من",
+        ]
+        all_labels = sorted(set(seller_labels + ship_labels), key=len, reverse=True)
+
+        def extract_value(labels: list[str]) -> str:
+            # Common two-line layout: label on one line and value on the next.
+            for i, line in enumerate(lines):
+                normalized = line.lower().rstrip(":：").strip()
+                for label in sorted(labels, key=len, reverse=True):
+                    if normalized == label.lower() and i + 1 < len(lines):
+                        return clean_text(lines[i + 1])
+
+            # Inline layouts, including two labeled fields on the same line.
+            for line in lines:
+                for label in sorted(labels, key=len, reverse=True):
+                    match = re.search(
+                        rf"(?:^|\\s){re.escape(label)}\\s*(?:[:：\\-]\\s*)?(.+)$",
+                        line,
+                        flags=re.I,
+                    )
+                    if not match:
+                        continue
+                    value = clean_text(match.group(1))
+                    cut_positions: list[int] = []
+                    for other in all_labels:
+                        marker = re.search(
+                            rf"\\s+{re.escape(other)}(?:\\s|[:：\\-]|$)",
+                            value,
+                            flags=re.I,
+                        )
+                        if marker:
+                            cut_positions.append(marker.start())
+                    if cut_positions:
+                        value = clean_text(value[: min(cut_positions)])
+                    if value:
+                        return value
+            return ""
+
+        return extract_value(seller_labels), extract_value(ship_labels)
+
+    def merchant(self) -> tuple[str, str]:
+        # The old script used merchantInfoFeature_feature_div. Keep that proven
+        # selector, but read the semantic value rather than a fixed array index.
+        seller = self._first_text([
+            (By.CSS_SELECTOR, "#merchantInfoFeature_feature_div .offer-display-feature-text-message"),
+            (By.ID, "sellerProfileTriggerId"),
+            (By.CSS_SELECTOR, "#merchantInfoFeature_feature_div a[href*='seller']"),
+        ])
+        ships_from = self._first_text([
+            (By.CSS_SELECTOR, "#fulfillerInfoFeature_feature_div .offer-display-feature-text-message"),
+            (By.CSS_SELECTOR, "#fulfillerInfoFeature_feature_div a"),
+        ])
+
+        # Amazon may render label/value pairs as plain text rather than links.
+        for block_id in ("merchantInfoFeature_feature_div", "fulfillerInfoFeature_feature_div"):
+            try:
+                block = self.driver.find_element(By.ID, block_id)
+                block_text = block.text or block.get_attribute("innerText") or ""
+                parsed_seller, parsed_ship = self._parse_labeled_lines(block_text)
+                seller = seller or parsed_seller
+                ships_from = ships_from or parsed_ship
+            except Exception:
+                pass
+
+        # Older layouts expose one merchant-info sentence.
+        merchant_info = self._first_text([(By.ID, "merchant-info")])
+        if merchant_info:
+            if not seller:
+                match = re.search(
+                    r"(?:shipper\\s*/\\s*seller|sold by)\\s*:?[ \\t]+(.+?)(?=\\s+(?:delivered by|ships from|dispatches from)\\b|\\.|$)",
+                    merchant_info,
+                    re.I,
+                )
+                if match:
+                    seller = clean_text(match.group(1))
+            if not ships_from:
+                match = re.search(
+                    r"(?:delivered by|ships from|dispatches from|shipped from)\\s*:?[ \\t]+(.+?)(?=\\s+(?:sold by|shipper\\s*/\\s*seller)\\b|\\.|$)",
+                    merchant_info,
+                    re.I,
+                )
+                if match:
+                    ships_from = clean_text(match.group(1))
+        return seller, ships_from
+'''
+          s = s[:start] + new_block + s[end:]
+          old_tail = '''        if not snapshot.stock_text:\n            snapshot.warnings.append("stock_text_missing")\n        return snapshot\n'''
+          new_tail = '''        if not snapshot.stock_text:\n            snapshot.warnings.append("stock_text_missing")\n        if snapshot.stock_status in {"IN_STOCK", "LOW_STOCK"} and not snapshot.buybox_seller:\n            snapshot.warnings.append("purchase_box_owner_missing")\n        return snapshot\n'''
+          if old_tail not in s:
+              raise RuntimeError("amazon_parser extract tail not found")
+          s = s.replace(old_tail, new_tail)
+          p.write_text(s, encoding="utf-8")
+
+          # 2) Business anomaly terminology.
+          p = Path("src/anomaly.py")
+          s = p.read_text(encoding="utf-8").replace('issues.append("BuyBox异常")', 'issues.append("购买框异常")')
+          p.write_text(s, encoding="utf-8")
+
+          # 3) Missing purchase-box owner on an in-stock own product is technical PARTIAL,
+          # not a business anomaly.
+          p = Path("src/scanner.py")
+          s = p.read_text(encoding="utf-8")
+          old = '''                core_missing = not snapshot.product_name or (snapshot.price_value is None and not snapshot.stock_text)\n                status = "PARTIAL" if core_missing else "OK"\n                reason = ",".join(snapshot.warnings) if status == "PARTIAL" else ""\n'''
+          new = '''                core_missing = not snapshot.product_name or (snapshot.price_value is None and not snapshot.stock_text)\n                purchase_box_missing = (\n                    target.product_type == "本品"\n                    and "purchase_box_owner_missing" in snapshot.warnings\n                )\n                status = "PARTIAL" if (core_missing or purchase_box_missing) else "OK"\n                reason = ",".join(snapshot.warnings) if status == "PARTIAL" else ""\n'''
+          if old not in s:
+              raise RuntimeError("scanner status block not found")
+          p.write_text(s.replace(old, new), encoding="utf-8")
+
+          # 4) Excel-facing business terminology and log fields.
+          p = Path("src/io_excel.py")
+          s = p.read_text(encoding="utf-8")
+          s = s.replace('"价格原始", "价格数值", "划线价格", "BuyBox卖家", "库存预警", "配送信息", "配送>10天",',
+                        '"价格原始", "价格数值", "划线价格", "购买框归属", "库存预警", "配送信息", "配送>10天",')
+          old = '''TECH_HEADERS = [\n    "扫描时间", "国家", "类型", "ASIN", "URL", "scan_status", "error_reason", "attempts",\n    "page_state", "stock_status", "ships_from", "页面标题", "debug_screenshot",\n]\n'''
+          new = '''TECH_HEADERS = [\n    "扫描时间", "国家", "类型", "ASIN", "URL", "scan_status", "error_reason", "attempts",\n    "page_state", "stock_status", "购买框归属", "配送方", "页面标题", "debug_screenshot",\n]\n'''
+          if old not in s:
+              raise RuntimeError("TECH_HEADERS block not found")
+          s = s.replace(old, new)
+          old = '''            result.snapshot.page_state, result.snapshot.stock_status, result.snapshot.ships_from,\n            result.snapshot.page_title, result.debug_screenshot,\n'''
+          new = '''            result.snapshot.page_state, result.snapshot.stock_status, result.snapshot.buybox_seller,\n            result.snapshot.ships_from, result.snapshot.page_title, result.debug_screenshot,\n'''
+          if old not in s:
+              raise RuntimeError("tech log row block not found")
+          p.write_text(s.replace(old, new), encoding="utf-8")
+
+          # 5) Tests for the two real AE page layouts supplied by the user.
+          p = Path("tests/test_utils.py")
+          s = p.read_text(encoding="utf-8")
+          if "from src.amazon_parser import AmazonParser" not in s:
+              s = s.replace("from src.anomaly import build_anomaly\n", "from src.amazon_parser import AmazonParser\nfrom src.anomaly import build_anomaly\n")
+          s = s.replace('assert "BuyBox异常" in result', 'assert "购买框异常" in result')
+          extra = '''\n\ndef test_purchase_box_label_variants():\n    seller, fulfiller = AmazonParser._parse_labeled_lines(\n        "Shipper / Seller\\nAmazon.ae\\nGift options\\nAvailable at checkout"\n    )\n    assert seller == "Amazon.ae"\n    assert fulfiller == ""\n\n    seller, fulfiller = AmazonParser._parse_labeled_lines(\n        "Delivered by\\nAmazon.ae\\nSold by\\nTell Tech Trading FZ-LLC\\nPayment\\nSecure transaction"\n    )\n    assert seller == "Tell Tech Trading FZ-LLC"\n    assert fulfiller == "Amazon.ae"\n\n    seller, fulfiller = AmazonParser._parse_labeled_lines(\n        "Delivered by Amazon.ae Sold by Tell Tech Trading FZ-LLC"\n    )\n    assert seller == "Tell Tech Trading FZ-LLC"\n    assert fulfiller == "Amazon.ae"\n\n\ndef test_missing_purchase_box_is_not_business_anomaly():\n    target = ScanTarget("AE", "本品", "P", "Phone", "B0GGQP6FQ3")\n    snap = ProductSnapshot(buybox_seller="", stock_status="IN_STOCK")\n    assert "购买框异常" not in build_anomaly(target, snap, ["Amazon.ae"])\n'''
+          if "def test_purchase_box_label_variants" not in s:
+              s += extra
+          p.write_text(s, encoding="utf-8")
+
+          # 6) Changelog.
+          p = Path("CHANGELOG.md")
+          s = p.read_text(encoding="utf-8")
+          entry = '''## 2.0.0-beta.3 - 2026-09-01\n\n- 将业务输出列 `BuyBox卖家` 更名为 `购买框归属`。\n- 兼容 AE/SA Buy Box 的 `Shipper / Seller`、`Sold by`、`Delivered by`、`Ships from` 等页面结构。\n- 恢复并增强旧版 `merchantInfoFeature_feature_div .offer-display-feature-text-message` 解析逻辑。\n- 区分“购买框被第三方占用”和“购买框归属未抓到”：前者标记 `购买框异常`，后者仅作为 `PARTIAL / purchase_box_owner_missing` 技术异常。\n- 运行日志新增 `购买框归属` 与 `配送方` 两列，便于排查。\n\n'''
+          if not s.startswith("## 2.0.0-beta.3"):
+              p.write_text(entry + s, encoding="utf-8")
+          PY
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt pytest
+
+      - name: Compile and test
+        run: |
+          python -m py_compile run_scan.py src/*.py tests/test_utils.py
+          pytest -q
+
+      - name: Commit tested update
+        shell: bash
+        run: |
+          rm -f .github/workflows/update-purchase-box.yml
+          git config user.name "water3ovo"
+          git config user.email "1367804732@qq.com"
+          git add -A
+          git commit -m "Fix AE SA purchase box owner parsing"
+          git push
