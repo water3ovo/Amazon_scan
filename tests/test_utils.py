@@ -1,5 +1,6 @@
 from datetime import date
 
+from src.amazon_parser import AmazonParser
 from src.anomaly import build_anomaly
 from src.models import ProductSnapshot, ScanTarget
 from src.utils import delivery_over_10_days, extract_asin, normalize_stock, parse_price_value
@@ -37,4 +38,30 @@ def test_anomaly():
     result = build_anomaly(target, snap, ["Amazon.ae"])
     assert "库存紧张" in result
     assert "配送>10天" in result
-    assert "BuyBox异常" in result
+    assert "购买框异常" in result
+
+
+def test_purchase_box_label_variants():
+    seller, fulfiller = AmazonParser._parse_labeled_lines(
+        "Shipper / Seller\nAmazon.ae\nGift options\nAvailable at checkout"
+    )
+    assert seller == "Amazon.ae"
+    assert fulfiller == ""
+
+    seller, fulfiller = AmazonParser._parse_labeled_lines(
+        "Delivered by\nAmazon.ae\nSold by\nTell Tech Trading FZ-LLC\nPayment\nSecure transaction"
+    )
+    assert seller == "Tell Tech Trading FZ-LLC"
+    assert fulfiller == "Amazon.ae"
+
+    seller, fulfiller = AmazonParser._parse_labeled_lines(
+        "Delivered by Amazon.ae Sold by Tell Tech Trading FZ-LLC"
+    )
+    assert seller == "Tell Tech Trading FZ-LLC"
+    assert fulfiller == "Amazon.ae"
+
+
+def test_missing_purchase_box_is_not_business_anomaly():
+    target = ScanTarget("AE", "本品", "P", "Phone", "B0GGQP6FQ3")
+    snap = ProductSnapshot(buybox_seller="", stock_status="IN_STOCK")
+    assert "购买框异常" not in build_anomaly(target, snap, ["Amazon.ae"])

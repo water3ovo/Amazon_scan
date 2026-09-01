@@ -83,49 +83,100 @@ class AmazonParser:
 
     @staticmethod
     def _parse_labeled_lines(text: str) -> tuple[str, str]:
+        """Parse Amazon Buy Box labels into purchase-box owner and fulfiller.
+
+        AE/SA currently use several layouts, including ``Shipper / Seller``,
+        ``Sold by``, ``Delivered by`` and ``Ships from``. A label/value pair may
+        be split across two lines or rendered inline on the same line.
+        """
         lines = [clean_text(x) for x in str(text).splitlines() if clean_text(x)]
-        seller = ""
-        ships_from = ""
-        seller_labels = {"sold by", "seller", "يباع بواسطة", "البائع"}
-        ship_labels = {"ships from", "dispatches from", "shipped from", "الشحن من"}
-        for i, line in enumerate(lines):
-            lower = line.lower().rstrip(":")
-            if lower in seller_labels and i + 1 < len(lines):
-                seller = lines[i + 1]
-            elif lower in ship_labels and i + 1 < len(lines):
-                ships_from = lines[i + 1]
-            else:
-                for label in seller_labels:
-                    if lower.startswith(label + ":"):
-                        seller = clean_text(line.split(":", 1)[1])
-                for label in ship_labels:
-                    if lower.startswith(label + ":"):
-                        ships_from = clean_text(line.split(":", 1)[1])
-        return seller, ships_from
+        seller_labels = [
+            "shipper / seller", "shipper/seller", "sold by", "seller",
+            "يُباع بواسطة", "يباع بواسطة", "البائع",
+        ]
+        ship_labels = [
+            "delivered by", "ships from", "dispatches from", "shipped from",
+            "الشحن من",
+        ]
+        all_labels = sorted(set(seller_labels + ship_labels), key=len, reverse=True)
+
+        def extract_value(labels: list[str]) -> str:
+            # Common two-line layout: label on one line and value on the next.
+            for i, line in enumerate(lines):
+                normalized = line.lower().rstrip(":：").strip()
+                for label in sorted(labels, key=len, reverse=True):
+                    if normalized == label.lower() and i + 1 < len(lines):
+                        return clean_text(lines[i + 1])
+
+            # Inline layouts, including two labeled fields on the same line.
+            for line in lines:
+                for label in sorted(labels, key=len, reverse=True):
+                    match = re.search(
+                        rf"(?:^|\s){re.escape(label)}\s*(?:[:：\-]\s*)?(.+)$",
+                        line,
+                        flags=re.I,
+                    )
+                    if not match:
+                        continue
+                    value = clean_text(match.group(1))
+                    cut_positions: list[int] = []
+                    for other in all_labels:
+                        marker = re.search(
+                            rf"\s+{re.escape(other)}(?:\s|[:：\-]|$)",
+                            value,
+                            flags=re.I,
+                        )
+                        if marker:
+                            cut_positions.append(marker.start())
+                    if cut_positions:
+                        value = clean_text(value[: min(cut_positions)])
+                    if value:
+                        return value
+            return ""
+
+        return extract_value(seller_labels), extract_value(ship_labels)
 
     def merchant(self) -> tuple[str, str]:
+        # The old script used merchantInfoFeature_feature_div. Keep that proven
+        # selector, but read the semantic value rather than a fixed array index.
         seller = self._first_text([
+            (By.CSS_SELECTOR, "#merchantInfoFeature_feature_div .offer-display-feature-text-message"),
             (By.ID, "sellerProfileTriggerId"),
             (By.CSS_SELECTOR, "#merchantInfoFeature_feature_div a[href*='seller']"),
         ])
-        ships_from = ""
+        ships_from = self._first_text([
+            (By.CSS_SELECTOR, "#fulfillerInfoFeature_feature_div .offer-display-feature-text-message"),
+            (By.CSS_SELECTOR, "#fulfillerInfoFeature_feature_div a"),
+        ])
 
-        try:
-            block = self.driver.find_element(By.ID, "merchantInfoFeature_feature_div")
-            parsed_seller, parsed_ship = self._parse_labeled_lines(block.text or block.get_attribute("innerText") or "")
-            seller = seller or parsed_seller
-            ships_from = parsed_ship
-        except Exception:
-            pass
+        # Amazon may render label/value pairs as plain text rather than links.
+        for block_id in ("merchantInfoFeature_feature_div", "fulfillerInfoFeature_feature_div"):
+            try:
+                block = self.driver.find_element(By.ID, block_id)
+                block_text = block.text or block.get_attribute("innerText") or ""
+                parsed_seller, parsed_ship = self._parse_labeled_lines(block_text)
+                seller = seller or parsed_seller
+                ships_from = ships_from or parsed_ship
+            except Exception:
+                pass
 
+        # Older layouts expose one merchant-info sentence.
         merchant_info = self._first_text([(By.ID, "merchant-info")])
         if merchant_info:
             if not seller:
-                match = re.search(r"sold by\s+(.+?)(?:\.|$)", merchant_info, re.I)
+                match = re.search(
+                    r"(?:shipper\s*/\s*seller|sold by)\s*:?[ \t]+(.+?)(?=\s+(?:delivered by|ships from|dispatches from)\b|\.|$)",
+                    merchant_info,
+                    re.I,
+                )
                 if match:
                     seller = clean_text(match.group(1))
             if not ships_from:
-                match = re.search(r"ships from\s+(.+?)(?:\.|sold by|$)", merchant_info, re.I)
+                match = re.search(
+                    r"(?:delivered by|ships from|dispatches from|shipped from)\s*:?[ \t]+(.+?)(?=\s+(?:sold by|shipper\s*/\s*seller)\b|\.|$)",
+                    merchant_info,
+                    re.I,
+                )
                 if match:
                     ships_from = clean_text(match.group(1))
         return seller, ships_from
@@ -274,4 +325,6 @@ class AmazonParser:
             snapshot.warnings.append("price_missing")
         if not snapshot.stock_text:
             snapshot.warnings.append("stock_text_missing")
+        if snapshot.stock_status in {"IN_STOCK", "LOW_STOCK"} and not snapshot.buybox_seller:
+            snapshot.warnings.append("purchase_box_owner_missing")
         return snapshot

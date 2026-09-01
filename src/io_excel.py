@@ -28,17 +28,17 @@ HEADER_ALIASES = {
 
 OWN_HEADERS = [
     "日期", "国家", "Portfolio", "产品", "ASIN", "URL", "产品名称", "配置", "颜色",
-    "价格原始", "价格数值", "划线价格", "BuyBox卖家", "库存预警", "配送信息", "配送>10天",
+    "价格原始", "价格数值", "划线价格", "购买框归属", "库存预警", "配送信息", "配送>10天",
     "评分", "评论数", "BSR一级", "BSR二级", "异常标注", "优惠标签", "Amazon精选", "备注",
 ]
 COMP_HEADERS = [
     "日期", "国家", "品牌", "产品", "ASIN", "URL", "产品名称", "配置", "颜色",
-    "价格原始", "价格数值", "划线价格", "BuyBox卖家", "库存预警", "配送信息", "配送>10天",
+    "价格原始", "价格数值", "划线价格", "购买框归属", "库存预警", "配送信息", "配送>10天",
     "评分", "评论数", "BSR一级", "BSR二级",
 ]
 TECH_HEADERS = [
     "扫描时间", "国家", "类型", "ASIN", "URL", "scan_status", "error_reason", "attempts",
-    "page_state", "stock_status", "ships_from", "页面标题", "debug_screenshot",
+    "page_state", "stock_status", "购买框归属", "配送方", "页面标题", "debug_screenshot",
 ]
 
 
@@ -181,8 +181,8 @@ def write_results(path: str | Path, results: list[ScanResult], started_at: datet
         ws_tech.append([
             datetime.now(), result.target.country, result.target.product_type, result.target.asin,
             result.target.url, result.scan_status, result.error_reason, result.attempts,
-            result.snapshot.page_state, result.snapshot.stock_status, result.snapshot.ships_from,
-            result.snapshot.page_title, result.debug_screenshot,
+            result.snapshot.page_state, result.snapshot.stock_status, result.snapshot.buybox_seller,
+            result.snapshot.ships_from, result.snapshot.page_title, result.debug_screenshot,
         ])
 
     for ws in (ws_own, ws_comp):

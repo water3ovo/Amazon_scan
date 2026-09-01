@@ -26,6 +26,6 @@ def build_anomaly(
         seller = snapshot.buybox_seller.lower()
         expected = [x.lower() for x in expected_seller_keywords if x]
         if expected and not any(keyword in seller for keyword in expected):
-            issues.append("BuyBox异常")
+            issues.append("购买框异常")
 
     return "；".join(dict.fromkeys(issues))

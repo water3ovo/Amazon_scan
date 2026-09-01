@@ -58,7 +58,11 @@ class Scanner:
                     return ScanResult(target, snapshot, "OK", "", attempt, screenshot, anomaly)
 
                 core_missing = not snapshot.product_name or (snapshot.price_value is None and not snapshot.stock_text)
-                status = "PARTIAL" if core_missing else "OK"
+                purchase_box_missing = (
+                    target.product_type == "本品"
+                    and "purchase_box_owner_missing" in snapshot.warnings
+                )
+                status = "PARTIAL" if (core_missing or purchase_box_missing) else "OK"
                 reason = ",".join(snapshot.warnings) if status == "PARTIAL" else ""
                 anomaly = build_anomaly(target, snapshot, country_cfg.get("expected_seller_keywords", []))
 

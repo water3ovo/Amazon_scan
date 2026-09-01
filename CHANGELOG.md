@@ -1,3 +1,11 @@
+## 2.0.0-beta.3 - 2026-09-01
+
+- 将业务输出列 `BuyBox卖家` 更名为 `购买框归属`。
+- 兼容 AE/SA Buy Box 的 `Shipper / Seller`、`Sold by`、`Delivered by`、`Ships from` 等页面结构。
+- 恢复并增强旧版 `merchantInfoFeature_feature_div .offer-display-feature-text-message` 解析逻辑。
+- 区分“购买框被第三方占用”和“购买框归属未抓到”：前者标记 `购买框异常`，后者仅作为 `PARTIAL / purchase_box_owner_missing` 技术异常。
+- 运行日志新增 `购买框归属` 与 `配送方` 两列，便于排查。
+
 # Changelog
 
 ## 2.0.0-beta.2
