@@ -26,7 +26,7 @@ jobs:
       - name: Compile and test
         run: |
           python -m py_compile run_scan.py src/*.py tests/test_utils.py
-          pytest -q
+          PYTHONPATH=. pytest -q
 
       - name: Commit tested update
         run: |
