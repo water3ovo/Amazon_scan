@@ -15,7 +15,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Apply beta4 patch
-        run: python tools/patch_beta4.py
+        run: |
+          python tools/patch_beta4.py
+          python tools/fix_beta4_test.py
 
       - name: Install test dependencies
         run: python -m pip install -r requirements.txt pytest
@@ -27,7 +29,7 @@ jobs:
 
       - name: Commit tested update
         run: |
-          rm -f tools/patch_beta4.py
+          rm -f tools/patch_beta4.py tools/fix_beta4_test.py
           rm -f .github/workflows/update-purchase-box-status.yml
           git config user.name "water3ovo"
           git config user.email "1367804732@qq.com"
