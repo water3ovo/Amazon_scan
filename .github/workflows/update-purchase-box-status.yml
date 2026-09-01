@@ -1,0 +1,200 @@
+name: Update purchase box status
+
+on:
+  push:
+    paths:
+      - ".github/workflows/update-purchase-box-status.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply purchase box status update
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          # models.py: persist an explicit purchase-box state.
+          p = Path("src/models.py")
+          s = p.read_text(encoding="utf-8")
+          old = '    buybox_seller: str = ""\n    ships_from: str = ""\n'
+          new = '    buybox_seller: str = ""\n    purchase_box_status: str = "UNKNOWN"\n    ships_from: str = ""\n'
+          if old not in s:
+              raise RuntimeError("models purchase box insertion point not found")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+
+          # amazon_parser.py: classify FOUND / NO_BUYBOX / PARSE_FAILED from multiple signals.
+          p = Path("src/amazon_parser.py")
+          s = p.read_text(encoding="utf-8")
+          marker = '    def stock(self) -> tuple[str, str]:\n'
+          if marker not in s:
+              raise RuntimeError("parser stock marker not found")
+          block = '''    @staticmethod
+    def _classify_purchase_box(
+        seller: str,
+        stock_status: str,
+        price_value: float | None,
+        has_checkout_controls: bool,
+        body_text: str,
+    ) -> str:
+        """Classify purchase-box state without treating a missing price as proof.
+
+        FOUND: a seller/owner was extracted.
+        NO_BUYBOX: Amazon explicitly shows no featured offer / unavailable state.
+        PARSE_FAILED: the page looks sellable (or is ambiguous) but owner parsing failed.
+        """
+        if clean_text(seller):
+            return "FOUND"
+
+        body = clean_text(body_text).lower()
+        no_buybox_markers = [
+            "see all buying options",
+            "see all buying choices",
+            "no featured offers available",
+            "currently unavailable",
+            "temporarily out of stock",
+            "currently out of stock",
+            "عرض جميع خيارات الشراء",
+            "غير متوفر حالياً",
+            "غير متوفر حاليا",
+            "غير متوفر حاليًا",
+        ]
+        if stock_status in {"OUT_OF_STOCK", "UNAVAILABLE"}:
+            return "NO_BUYBOX"
+        if any(marker in body for marker in no_buybox_markers):
+            return "NO_BUYBOX"
+
+        # A checkout button, visible price, or in-stock signal means a purchase box
+        # is likely present; failure to read the owner is a parser issue, not loss.
+        if has_checkout_controls or price_value is not None or stock_status in {"IN_STOCK", "LOW_STOCK"}:
+            return "PARSE_FAILED"
+
+        # Missing price by itself is not enough to call Buy Box loss: it can also
+        # come from a changed DOM, unselected variation, geo state, or parser miss.
+        return "PARSE_FAILED"
+
+    def purchase_box_status(
+        self,
+        seller: str,
+        stock_status: str,
+        price_value: float | None,
+    ) -> str:
+        checkout_selectors = [
+            (By.ID, "add-to-cart-button"),
+            (By.ID, "buy-now-button"),
+            (By.CSS_SELECTOR, "input[name='submit.add-to-cart']"),
+            (By.CSS_SELECTOR, "input[name='submit.buy-now']"),
+        ]
+        has_checkout_controls = False
+        for by, selector in checkout_selectors:
+            try:
+                if self.driver.find_elements(by, selector):
+                    has_checkout_controls = True
+                    break
+            except Exception:
+                continue
+        return self._classify_purchase_box(
+            seller=seller,
+            stock_status=stock_status,
+            price_value=price_value,
+            has_checkout_controls=has_checkout_controls,
+            body_text=self._body_text(),
+        )
+
+'''
+          s = s.replace(marker, block + marker, 1)
+
+          old_extract = '''        snapshot.buybox_seller, snapshot.ships_from = self.merchant()\n        snapshot.stock_text, snapshot.stock_status = self.stock()\n        snapshot.delivery_text, snapshot.delivery_over_10_days = self.delivery()\n'''
+          new_extract = '''        snapshot.buybox_seller, snapshot.ships_from = self.merchant()\n        snapshot.stock_text, snapshot.stock_status = self.stock()\n        snapshot.purchase_box_status = self.purchase_box_status(\n            snapshot.buybox_seller, snapshot.stock_status, snapshot.price_value\n        )\n        snapshot.delivery_text, snapshot.delivery_over_10_days = self.delivery()\n'''
+          if old_extract not in s:
+              raise RuntimeError("parser extract block not found")
+          s = s.replace(old_extract, new_extract, 1)
+
+          old_warning = '''        if snapshot.stock_status in {"IN_STOCK", "LOW_STOCK"} and not snapshot.buybox_seller:\n            snapshot.warnings.append("purchase_box_owner_missing")\n'''
+          new_warning = '''        if snapshot.purchase_box_status == "PARSE_FAILED":\n            snapshot.warnings.append("purchase_box_parse_failed")\n'''
+          if old_warning not in s:
+              raise RuntimeError("old purchase-box warning not found")
+          s = s.replace(old_warning, new_warning, 1)
+          p.write_text(s, encoding="utf-8")
+
+          # anomaly.py: detailed business labels with the actual third-party seller name.
+          Path("src/anomaly.py").write_text('''from __future__ import annotations\n\nfrom .models import ProductSnapshot, ScanTarget\n\n\ndef build_anomaly(\n    target: ScanTarget,\n    snapshot: ProductSnapshot,\n    expected_seller_keywords: list[str] | None = None,\n) -> str:\n    """Return business anomalies only; parser failures stay in error_reason."""\n    issues: list[str] = []\n\n    if snapshot.page_state == "PRODUCT_NOT_FOUND":\n        issues.append("页面异常")\n\n    if target.product_type == "本品":\n        if snapshot.purchase_box_status == "NO_BUYBOX":\n            issues.append("buy box丢失")\n        elif (\n            snapshot.purchase_box_status == "FOUND"\n            and snapshot.buybox_seller\n            and expected_seller_keywords\n        ):\n            seller_lower = snapshot.buybox_seller.lower()\n            expected = [x.lower() for x in expected_seller_keywords if x]\n            if expected and not any(keyword in seller_lower for keyword in expected):\n                issues.append(f"buy box被第三方抢占（{snapshot.buybox_seller}）")\n\n    if snapshot.stock_status in {"OUT_OF_STOCK", "UNAVAILABLE"}:\n        issues.append("缺货")\n    elif snapshot.stock_status == "LOW_STOCK":\n        issues.append("库存紧张")\n\n    if snapshot.delivery_over_10_days == "Yes":\n        issues.append("配送时间大于10天")\n\n    return "；".join(dict.fromkeys(issues))\n''', encoding="utf-8")
+
+          # scanner.py: NO_BUYBOX is a valid business state; PARSE_FAILED is technical PARTIAL.
+          p = Path("src/scanner.py")
+          s = p.read_text(encoding="utf-8")
+          old = '''                core_missing = not snapshot.product_name or (snapshot.price_value is None and not snapshot.stock_text)\n                purchase_box_missing = (\n                    target.product_type == "本品"\n                    and "purchase_box_owner_missing" in snapshot.warnings\n                )\n                status = "PARTIAL" if (core_missing or purchase_box_missing) else "OK"\n'''
+          new = '''                core_missing = not snapshot.product_name or (\n                    snapshot.price_value is None\n                    and not snapshot.stock_text\n                    and snapshot.purchase_box_status != "NO_BUYBOX"\n                )\n                purchase_box_parse_failed = (\n                    target.product_type == "本品"\n                    and snapshot.purchase_box_status == "PARSE_FAILED"\n                )\n                status = "PARTIAL" if (core_missing or purchase_box_parse_failed) else "OK"\n'''
+          if old not in s:
+              raise RuntimeError("scanner purchase-box status block not found")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+
+          # io_excel.py: keep the existing 24 business columns stable and append status as Y.
+          p = Path("src/io_excel.py")
+          s = p.read_text(encoding="utf-8")
+          old_headers = '''    "评分", "评论数", "BSR一级", "BSR二级", "异常标注", "优惠标签", "Amazon精选", "备注",\n]\n'''
+          new_headers = '''    "评分", "评论数", "BSR一级", "BSR二级", "异常标注", "优惠标签", "Amazon精选", "备注",\n    "购买框状态",\n]\n'''
+          if old_headers not in s:
+              raise RuntimeError("own headers tail not found")
+          s = s.replace(old_headers, new_headers, 1)
+
+          old_tech = '''    "page_state", "stock_status", "购买框归属", "配送方", "页面标题", "debug_screenshot",\n]\n'''
+          new_tech = '''    "page_state", "stock_status", "购买框状态", "购买框归属", "配送方", "页面标题", "debug_screenshot",\n]\n'''
+          if old_tech not in s:
+              raise RuntimeError("tech headers not found")
+          s = s.replace(old_tech, new_tech, 1)
+
+          old_row = '''        s.bsr_primary, s.bsr_secondary, result.anomaly, s.deal_tag, s.amazon_choice, note,\n    ]\n'''
+          new_row = '''        s.bsr_primary, s.bsr_secondary, result.anomaly, s.deal_tag, s.amazon_choice, note,\n        s.purchase_box_status,\n    ]\n'''
+          if old_row not in s:
+              raise RuntimeError("own row tail not found")
+          s = s.replace(old_row, new_row, 1)
+
+          old_logrow = '''            result.snapshot.page_state, result.snapshot.stock_status, result.snapshot.buybox_seller,\n            result.snapshot.ships_from, result.snapshot.page_title, result.debug_screenshot,\n'''
+          new_logrow = '''            result.snapshot.page_state, result.snapshot.stock_status, result.snapshot.purchase_box_status,\n            result.snapshot.buybox_seller, result.snapshot.ships_from, result.snapshot.page_title, result.debug_screenshot,\n'''
+          if old_logrow not in s:
+              raise RuntimeError("tech log row not found")
+          s = s.replace(old_logrow, new_logrow, 1)
+          s = s.replace('24: 30})', '24: 30, 25: 18})', 1)
+          p.write_text(s, encoding="utf-8")
+
+          # Tests: explicit status semantics and seller-specific anomaly label.
+          p = Path("tests/test_utils.py")
+          s = p.read_text(encoding="utf-8")
+          s = s.replace('''    snap = ProductSnapshot(\n        buybox_seller="Other Seller",\n        stock_status="LOW_STOCK",\n        delivery_over_10_days="Yes",\n    )\n''', '''    snap = ProductSnapshot(\n        buybox_seller="Other Seller",\n        purchase_box_status="FOUND",\n        stock_status="LOW_STOCK",\n        delivery_over_10_days="Yes",\n    )\n''')
+          s = s.replace('assert "购买框异常" in result', 'assert "buy box被第三方抢占（Other Seller）" in result')
+          s = s.replace('''    snap = ProductSnapshot(buybox_seller="", stock_status="IN_STOCK")\n    assert "购买框异常" not in build_anomaly(target, snap, ["Amazon.ae"])\n''', '''    snap = ProductSnapshot(\n        buybox_seller="", purchase_box_status="PARSE_FAILED", stock_status="IN_STOCK"\n    )\n    assert "buy box丢失" not in build_anomaly(target, snap, ["Amazon.ae"])\n''')
+          extra = '''\n\ndef test_purchase_box_status_signals():\n    assert AmazonParser._classify_purchase_box(\n        seller="Amazon.ae", stock_status="IN_STOCK", price_value=2699.0,\n        has_checkout_controls=True, body_text="In Stock"\n    ) == "FOUND"\n\n    assert AmazonParser._classify_purchase_box(\n        seller="", stock_status="UNAVAILABLE", price_value=None,\n        has_checkout_controls=False, body_text="Currently unavailable"\n    ) == "NO_BUYBOX"\n\n    assert AmazonParser._classify_purchase_box(\n        seller="", stock_status="IN_STOCK", price_value=2699.0,\n        has_checkout_controls=True, body_text="In Stock"\n    ) == "PARSE_FAILED"\n\n    # No price alone must not be treated as proof of Buy Box loss.\n    assert AmazonParser._classify_purchase_box(\n        seller="", stock_status="UNKNOWN", price_value=None,\n        has_checkout_controls=False, body_text="Product detail page"\n    ) == "PARSE_FAILED"\n\n\ndef test_purchase_box_loss_and_specific_seller_anomaly():\n    target = ScanTarget("AE", "本品", "P", "Phone", "B0GGQP6FQ3")\n    lost = ProductSnapshot(purchase_box_status="NO_BUYBOX", stock_status="UNAVAILABLE")\n    assert "buy box丢失" in build_anomaly(target, lost, ["Amazon.ae"])\n\n    third_party = ProductSnapshot(\n        buybox_seller="Tell Tech Trading FZ-LLC",\n        purchase_box_status="FOUND",\n        stock_status="IN_STOCK",\n    )\n    assert "buy box被第三方抢占（Tell Tech Trading FZ-LLC）" in build_anomaly(\n        target, third_party, ["Amazon.ae"]\n    )\n'''
+          if "def test_purchase_box_status_signals" not in s:
+              s += extra
+          p.write_text(s, encoding="utf-8")
+
+          # Changelog
+          p = Path("CHANGELOG.md")
+          s = p.read_text(encoding="utf-8")
+          entry = '''## 2.0.0-beta.4 - 2026-09-01\n\n- 新增 `购买框状态`：`FOUND` / `NO_BUYBOX` / `PARSE_FAILED`。\n- 不再把“没有价格”单独等同于 Buy Box 丢失；改用 Seller、库存、Add to Cart / Buy Now、Amazon 明确不可售文案等多信号判断。\n- 第三方抢占会保留实际 Seller 名，例如 `buy box被第三方抢占（Tell Tech Trading FZ-LLC）`。\n- 明确无购买框时标记 `buy box丢失`；解析失败只记技术状态 `PARTIAL / purchase_box_parse_failed`，避免误报。\n- 本品输出末尾新增 `购买框状态` 列，原有 A:X 列顺序不变。\n\n'''
+          if not s.startswith("## 2.0.0-beta.4"):
+              p.write_text(entry + s, encoding="utf-8")
+          PY
+
+      - name: Install and test
+        run: |
+          python -m pip install -r requirements.txt pytest
+          python -m py_compile run_scan.py src/*.py tests/test_utils.py
+          PYTHONPATH=. pytest -q
+
+      - name: Commit tested update
+        shell: bash
+        run: |
+          rm -f .github/workflows/update-purchase-box-status.yml
+          git config user.name "water3ovo"
+          git config user.email "1367804732@qq.com"
+          git add -A
+          git commit -m "Add robust purchase box status classification"
+          git push
