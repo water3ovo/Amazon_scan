@@ -12,6 +12,8 @@ from .models import ScanResult, ScanTarget
 from .utils import clean_text, extract_asin
 
 ACTIVE_VALUES = {"在投", "投放中", "active", "yes", "y", "true", "1"}
+INACTIVE_VALUES = {"非在投", "未投放", "inactive", "no", "n", "false", "0", "off"}
+STATUS_VALUES = {x.lower() for x in (ACTIVE_VALUES | INACTIVE_VALUES)}
 
 HEADER_ALIASES = {
     "国家": ["国家", "country", "Country"],
@@ -84,6 +86,10 @@ def load_targets(path: str | Path, filter_active_products: bool = True) -> list[
         raise ValueError("输入表至少需要‘ASIN’或‘URL’列。")
 
     merged: OrderedDict[tuple[str, str], ScanTarget] = OrderedDict()
+    own_rows = 0
+    own_status_nonblank = 0
+    own_status_recognized = 0
+    competitor_rows = 0
     for row in rows:
         country = _value(row, lookup, "国家").upper()
         url = _value(row, lookup, "URL")
@@ -92,6 +98,27 @@ def load_targets(path: str | Path, filter_active_products: bool = True) -> list[
             continue
         product_type = _value(row, lookup, "类型") or "本品"
         active_status = _value(row, lookup, "在投状态")
+        remark = _value(row, lookup, "备注")
+
+        # beta4.2 compatibility: the old local template accidentally put
+        # “在投状态” before “备注”, while the Google Mapping uses the opposite
+        # order. If users pasted Mapping values under the old header, the two
+        # fields are semantically swapped. Detect status-like text and repair it.
+        active_norm = active_status.strip().lower()
+        remark_norm = remark.strip().lower()
+        if remark_norm in STATUS_VALUES and active_norm not in STATUS_VALUES:
+            active_status, remark = remark, active_status
+            active_norm = active_status.strip().lower()
+
+        if product_type == "本品":
+            own_rows += 1
+            if active_status:
+                own_status_nonblank += 1
+            if active_norm in STATUS_VALUES:
+                own_status_recognized += 1
+        elif product_type == "竞品":
+            competitor_rows += 1
+
         if filter_active_products and product_type == "本品" and "在投状态" in lookup:
             if active_status.strip().lower() not in {x.lower() for x in ACTIVE_VALUES}:
                 continue
@@ -106,7 +133,7 @@ def load_targets(path: str | Path, filter_active_products: bool = True) -> list[
             color=_value(row, lookup, "颜色"),
             url=url,
             active_status=active_status,
-            remark=_value(row, lookup, "备注"),
+            remark=remark,
         )
         key = (country, asin)
         if key not in merged:
@@ -117,6 +144,18 @@ def load_targets(path: str | Path, filter_active_products: bool = True) -> list[
             for attr in ("portfolio_brand", "product", "configuration", "color", "url", "active_status", "remark"):
                 if not getattr(existing, attr) and getattr(target, attr):
                     setattr(existing, attr, getattr(target, attr))
+
+    if (
+        filter_active_products
+        and "在投状态" in lookup
+        and own_rows > 0
+        and own_status_recognized == 0
+    ):
+        raise ValueError(
+            "检测到本品行存在，但没有识别到有效的‘在投状态’（在投/非在投）。"
+            "请检查 input 表头是否为：URL、备注、在投状态；或直接把 Mapping 连同第一行表头一起复制。"
+        )
+
     return list(merged.values())
 
 
@@ -229,7 +268,7 @@ def create_target_template(path: str | Path):
     wb = Workbook()
     ws = wb.active
     ws.title = "scan_targets"
-    headers = ["国家", "类型", "Portfolio/品牌", "产品", "ASIN", "配置", "颜色", "URL", "在投状态", "备注"]
+    headers = ["国家", "类型", "Portfolio/品牌", "产品", "ASIN", "配置", "颜色", "URL", "备注", "在投状态"]
     ws.append(headers)
-    _style_sheet(ws, {1: 10, 2: 10, 3: 28, 4: 24, 5: 14, 6: 16, 7: 16, 8: 45, 9: 12, 10: 32})
+    _style_sheet(ws, {1: 10, 2: 10, 3: 28, 4: 24, 5: 14, 6: 16, 7: 16, 8: 45, 9: 32, 10: 12})
     wb.save(path)
