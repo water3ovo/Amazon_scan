@@ -1,3 +1,15 @@
+## 2.0.0-beta.5 - 2026-09-03
+
+- 新增 Google Sheets API 自动读写模式：默认从线上 `Mapping` 直接读取扫查目标，不再要求每天复制本地 input。
+- 本品继续只扫描 `在投状态=在投`，竞品全部扫描，并按 `国家+ASIN` 去重。
+- 扫查结束后仍保留本地 Excel 原始备份，并自动把结果写回 `本品扫查明细` / `竞品扫查明细`。
+- Google Sheet 写回按 `日期+国家+ASIN` upsert：同一天重复运行更新原记录，不新增重复行。
+- `FAILED` 技术失败默认不写入业务明细，避免一次网络/浏览器失败覆盖当天已有的成功结果；失败详情仍保留在本地运行日志。
+- Google Mapping 读取失败时不会静默回退到旧本地 Mapping，避免误扫过期目标；可使用 `--local-only` 手动启用本地备用输入。
+- 新增 `--test-google` 与 `测试GoogleSheet连接.bat`，可在正式扫查前单独验证服务账号密钥和表格权限。
+- 新增 `升级V5依赖.bat`，已有 beta4.x 用户只需补装 Google API 依赖，无需重建 `.venv` 或重新配置 AE/SA Profile。
+- `config/google_service_account.json` 与 `config/google_sheets.json` 已加入 `.gitignore`，密钥不会进入公开 GitHub。
+
 ## 2.0.0-beta.4.2 - 2026-09-02
 
 - 修复本地 `scan_targets.xlsx` 旧模板与 Google Sheet `Mapping` 的 I/J 列顺序不一致：Google Sheet 为 `备注, 在投状态`，旧模板误写为 `在投状态, 备注`。
