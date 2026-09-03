@@ -9,6 +9,8 @@ output/*
 !output/.gitkeep
 input/*.xlsx
 input/*.xls
+config/google_service_account.json
+config/google_sheets.json
 *.log
 .DS_Store
 Thumbs.db
