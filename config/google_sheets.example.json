@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "spreadsheet_id": "PASTE_SPREADSHEET_ID_HERE",
+  "credentials_file": "config/google_service_account.json",
+  "mapping_sheet": "Mapping",
+  "mapping_range": "A:J",
+  "own_detail_sheet": "本品扫查明细",
+  "competitor_detail_sheet": "竞品扫查明细",
+  "own_max_rows": 5000,
+  "competitor_max_rows": 3000
+}
