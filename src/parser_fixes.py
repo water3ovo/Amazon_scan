@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
+
 from selenium.webdriver.common.by import By
 
-from .utils import clean_text, normalize_stock
+from .utils import clean_text
 
 
 SCRIPT_JUNK_MARKERS = (
@@ -14,24 +16,6 @@ SCRIPT_JUNK_MARKERS = (
     "settimeout(",
     "window.ue",
     "a.state(",
-)
-
-STOCK_TEXT_MARKERS = (
-    "in stock",
-    "left in stock",
-    "out of stock",
-    "currently unavailable",
-    "temporarily out of stock",
-    "unavailable",
-    "available to ship",
-    "usually ships within",
-    "ships within",
-    "more on the way",
-    "order soon",
-    "متوفر",
-    "غير متوفر",
-    "نفد من المخزون",
-    "متبقي",
 )
 
 PRICE_HIGH_MARKERS = (
@@ -51,6 +35,58 @@ NO_FEATURED_OFFER_MARKERS = (
 )
 
 
+def _strict_stock_status(value: str) -> str:
+    """Classify only explicit stock/availability wording.
+
+    This intentionally avoids the historical broad ``only `` rule, which could
+    turn ordinary product copy such as ``USA MARKET ONLY`` into LOW_STOCK.
+    """
+    text = clean_text(value)
+    if not text:
+        return "UNKNOWN"
+    lower = text.lower()
+
+    unavailable = (
+        "currently unavailable",
+        "temporarily out of stock",
+        "unavailable",
+        "not available",
+        "غير متوفر",
+        "غير متاح",
+    )
+    out_of_stock = (
+        "out of stock",
+        "sold out",
+        "no longer available",
+        "نفد من المخزون",
+    )
+    low_stock = (
+        "left in stock",
+        "few left",
+        "limited stock",
+        "تبقى فقط",
+        "متبقي",
+    )
+    in_stock = (
+        "in stock",
+        "available to ship",
+        "متوفر في المخزون",
+        "متوفر",
+    )
+
+    if any(x in lower for x in unavailable):
+        return "UNAVAILABLE"
+    if any(x in lower for x in out_of_stock):
+        return "OUT_OF_STOCK"
+    if any(x in lower for x in low_stock):
+        return "LOW_STOCK"
+    if re.search(r"\bonly\s+\d+\s+.*?left\s+in\s+stock\b", lower):
+        return "LOW_STOCK"
+    if any(x in lower for x in in_stock):
+        return "IN_STOCK"
+    return "UNKNOWN"
+
+
 def _is_valid_stock_text(value: str) -> bool:
     text = clean_text(value)
     if not text:
@@ -60,15 +96,11 @@ def _is_valid_stock_text(value: str) -> bool:
         return False
     if any(marker in lower for marker in SCRIPT_JUNK_MARKERS):
         return False
-    return normalize_stock(text) != "UNKNOWN" or any(marker in lower for marker in STOCK_TEXT_MARKERS)
+    return _strict_stock_status(text) != "UNKNOWN"
 
 
 def _visible_text(element) -> str:
-    """Read visible text only; never fall back to textContent for stock blocks.
-
-    Amazon AOD containers may contain large inline scripts in textContent even
-    when those scripts are not visible on the product page.
-    """
+    """Read visible text only; never fall back to textContent for stock blocks."""
     try:
         return clean_text(element.text)
     except Exception:
@@ -76,6 +108,13 @@ def _visible_text(element) -> str:
 
 
 def fixed_stock(self) -> tuple[str, str]:
+    """Read stock only from the main product / purchase-box availability area.
+
+    Do not scan the whole page. On a suppressed/no-Featured-Offer page Amazon
+    can preload AOD/other-offer inventory such as ``Only 1 left in stock``.
+    That is not the main Featured Offer inventory and must not be reported as
+    the product's stock warning.
+    """
     selectors = [
         (By.CSS_SELECTOR, "#availability .a-color-success"),
         (By.CSS_SELECTOR, "#availability .a-color-price"),
@@ -90,21 +129,12 @@ def fixed_stock(self) -> tuple[str, str]:
         try:
             for element in self.driver.find_elements(by, selector):
                 raw = _visible_text(element)
+                status = _strict_stock_status(raw)
                 if _is_valid_stock_text(raw):
-                    return raw, normalize_stock(raw)
+                    return raw, status
         except Exception:
             continue
 
-    # Conservative fallback: inspect visible body lines, but only accept a line
-    # that itself looks like a stock/availability message.
-    try:
-        body = self.driver.find_element(By.TAG_NAME, "body").text or ""
-        for line in str(body).splitlines():
-            raw = clean_text(line)
-            if _is_valid_stock_text(raw):
-                return raw, normalize_stock(raw)
-    except Exception:
-        pass
     return "", "UNKNOWN"
 
 
@@ -115,11 +145,7 @@ def classify_purchase_box_reason(
     has_checkout_controls: bool,
     body_text: str,
 ) -> tuple[str, str]:
-    """Return (purchase_box_status, reason) without conflating parser misses.
-
-    reason values are intentionally technical/stable; business-facing Chinese
-    labels are produced in anomaly.py.
-    """
+    """Return (purchase_box_status, reason) without conflating parser misses."""
     if clean_text(seller):
         return "FOUND", ""
 
@@ -136,9 +162,6 @@ def classify_purchase_box_reason(
     if stock_status in {"OUT_OF_STOCK", "UNAVAILABLE"}:
         return "NO_BUYBOX", "OUT_OF_STOCK"
 
-    # A visible checkout control, price, or positive stock state means the page
-    # looks sellable; missing Seller is therefore a parser issue, not business
-    # proof that the Featured Offer is gone.
     if has_checkout_controls or price_value is not None or stock_status in {"IN_STOCK", "LOW_STOCK"}:
         return "PARSE_FAILED", "PARSER_MISS"
 
@@ -173,7 +196,7 @@ def fixed_purchase_box_status(self, seller: str, stock_status: str, price_value:
 
 
 def apply_parser_fixes(parser_cls):
-    """Apply V5.2 parser hotfixes without changing the public output schema."""
+    """Apply parser hotfixes without changing the public output schema."""
     if getattr(parser_cls, "_v52_parser_fixes_applied", False):
         return parser_cls
 
@@ -182,8 +205,6 @@ def apply_parser_fixes(parser_cls):
     def fixed_extract(self):
         self._last_purchase_box_reason = ""
         snapshot = original_extract(self)
-        # ProductSnapshot is not slotted; keeping this dynamic avoids a schema
-        # migration while still allowing anomaly.py to use the reason.
         snapshot.purchase_box_reason = getattr(self, "_last_purchase_box_reason", "")
         return snapshot
 
