@@ -68,6 +68,9 @@ class GoogleSheetsClient:
         self.base_dir = Path(base_dir)
         self.config_path = Path(config_path)
         self.config = self._load_config()
+        self.http_timeout = max(30, int(self.config.get("http_timeout_seconds", 120)))
+        self.api_retries = max(0, int(self.config.get("api_retries", 4)))
+        self.credentials = None
         self.service = self._build_service()
 
     def _load_config(self) -> dict:
@@ -81,7 +84,9 @@ class GoogleSheetsClient:
 
     def _build_service(self):
         try:
+            import httplib2
             from google.oauth2.service_account import Credentials
+            from google_auth_httplib2 import AuthorizedHttp
             from googleapiclient.discovery import build
         except ImportError as exc:
             raise GoogleSheetsError(
@@ -97,21 +102,49 @@ class GoogleSheetsClient:
                 f"未找到 Google 服务账号密钥: {credentials_path}\n"
                 "请把刚下载的 JSON 密钥复制到 config/google_service_account.json。"
             )
-        creds = Credentials.from_service_account_file(
+
+        self.credentials = Credentials.from_service_account_file(
             str(credentials_path),
             scopes=["https://www.googleapis.com/auth/spreadsheets"],
         )
-        return build("sheets", "v4", credentials=creds, cache_discovery=False)
+        http = httplib2.Http(timeout=self.http_timeout)
+        authorized_http = AuthorizedHttp(self.credentials, http=http)
+        return build(
+            "sheets",
+            "v4",
+            http=authorized_http,
+            cache_discovery=False,
+        )
 
     @property
     def spreadsheet_id(self) -> str:
         return self.config["spreadsheet_id"]
 
     def test_connection(self) -> dict:
-        meta = self.service.spreadsheets().get(
-            spreadsheetId=self.spreadsheet_id,
-            fields="properties.title,sheets.properties.title",
-        ).execute()
+        try:
+            from google.auth.transport.requests import Request
+            print("[Google 1/2] 正在获取服务账号访问令牌...")
+            self.credentials.refresh(Request())
+            print("[Google 1/2] 访问令牌获取成功。")
+        except Exception as exc:
+            raise GoogleSheetsError(
+                "获取 Google 访问令牌失败（oauth2.googleapis.com）。"
+                f" 原始错误: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        try:
+            print("[Google 2/2] 正在读取目标 Google Sheet...")
+            meta = self.service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id,
+                fields="properties.title,sheets.properties.title",
+            ).execute(num_retries=self.api_retries)
+            print("[Google 2/2] Google Sheet 读取成功。")
+        except Exception as exc:
+            raise GoogleSheetsError(
+                "读取 Google Sheet 失败（sheets.googleapis.com）。"
+                f" 原始错误: {type(exc).__name__}: {exc}"
+            ) from exc
+
         return {
             "title": meta.get("properties", {}).get("title", ""),
             "sheets": [x.get("properties", {}).get("title", "") for x in meta.get("sheets", [])],
@@ -125,7 +158,7 @@ class GoogleSheetsClient:
             spreadsheetId=self.spreadsheet_id,
             range=range_name,
             valueRenderOption="FORMATTED_VALUE",
-        ).execute()
+        ).execute(num_retries=self.api_retries)
         values = response.get("values", [])
         if not values:
             raise GoogleSheetsError(f"Google Sheet 的 {sheet} 没有数据。")
@@ -176,7 +209,7 @@ class GoogleSheetsClient:
             spreadsheetId=self.spreadsheet_id,
             range=range_name,
             valueRenderOption="FORMATTED_VALUE",
-        ).execute()
+        ).execute(num_retries=self.api_retries)
         values = response.get("values", [])
         keys: dict[tuple[str, str, str], int] = {}
         free_rows: list[int] = []
@@ -224,7 +257,7 @@ class GoogleSheetsClient:
             self.service.spreadsheets().values().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
                 body={"valueInputOption": "USER_ENTERED", "data": chunk},
-            ).execute()
+            ).execute(num_retries=self.api_retries)
         return {"updated": updated, "inserted": inserted}
 
     def upsert_results(self, results: list[ScanResult]) -> dict:
