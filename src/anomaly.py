@@ -16,7 +16,13 @@ def build_anomaly(
 
     if target.product_type == "本品":
         if snapshot.purchase_box_status == "NO_BUYBOX":
-            issues.append("buy box丢失")
+            reason = getattr(snapshot, "purchase_box_reason", "")
+            if reason == "PRICE_HIGHER_THAN_TYPICAL":
+                issues.append("buy box丢失（价格高于典型价格）")
+            elif reason == "NO_FEATURED_OFFER":
+                issues.append("buy box丢失（无Featured Offer）")
+            else:
+                issues.append("buy box丢失")
         elif (
             snapshot.purchase_box_status == "FOUND"
             and snapshot.buybox_seller
