@@ -3,6 +3,7 @@ from datetime import date
 from src.amazon_parser import AmazonParser
 from src.anomaly import build_anomaly
 from src.models import ProductSnapshot, ScanTarget
+from src.parser_fixes import _is_valid_stock_text, classify_purchase_box_reason
 from src.utils import delivery_over_10_days, extract_asin, normalize_stock, parse_price_value
 
 
@@ -19,6 +20,13 @@ def test_stock():
     assert normalize_stock("In Stock") == "IN_STOCK"
     assert normalize_stock("Only 2 left in stock") == "LOW_STOCK"
     assert normalize_stock("Currently unavailable") == "UNAVAILABLE"
+
+
+def test_stock_javascript_is_rejected():
+    junk = 'P.when("A", "load").execute("aod-assets-loaded", function(A){ window.ue.count("x", 1); });'
+    assert not _is_valid_stock_text(junk)
+    assert _is_valid_stock_text("Only 1 left in stock (more on the way).")
+    assert _is_valid_stock_text("Temporarily out of stock. Order now and we'll deliver when available.")
 
 
 def test_delivery():
@@ -86,11 +94,40 @@ def test_purchase_box_status_signals():
         has_checkout_controls=True, body_text="In Stock"
     ) == "PARSE_FAILED"
 
-    # No price alone must not be treated as proof of Buy Box loss.
     assert AmazonParser._classify_purchase_box(
         seller="", stock_status="UNKNOWN", price_value=None,
         has_checkout_controls=False, body_text="Product detail page"
     ) == "PARSE_FAILED"
+
+
+def test_specific_no_buybox_reasons():
+    status, reason = classify_purchase_box_reason(
+        seller="", stock_status="UNKNOWN", price_value=None,
+        has_checkout_controls=False,
+        body_text="Price higher than typical See all buying options",
+    )
+    assert status == "NO_BUYBOX"
+    assert reason == "PRICE_HIGHER_THAN_TYPICAL"
+
+    status, reason = classify_purchase_box_reason(
+        seller="", stock_status="UNKNOWN", price_value=None,
+        has_checkout_controls=False,
+        body_text="No featured offers available See all buying options",
+    )
+    assert status == "NO_BUYBOX"
+    assert reason == "NO_FEATURED_OFFER"
+
+
+def test_specific_no_buybox_anomaly_labels():
+    target = ScanTarget("AE", "本品", "P", "Phone", "B0GGQP6FQ3")
+
+    price_high = ProductSnapshot(purchase_box_status="NO_BUYBOX", stock_status="UNKNOWN")
+    price_high.purchase_box_reason = "PRICE_HIGHER_THAN_TYPICAL"
+    assert build_anomaly(target, price_high, ["Amazon.ae"]) == "buy box丢失（价格高于典型价格）"
+
+    no_featured = ProductSnapshot(purchase_box_status="NO_BUYBOX", stock_status="UNKNOWN")
+    no_featured.purchase_box_reason = "NO_FEATURED_OFFER"
+    assert build_anomaly(target, no_featured, ["Amazon.ae"]) == "buy box丢失（无Featured Offer）"
 
 
 def test_purchase_box_loss_and_specific_seller_anomaly():
