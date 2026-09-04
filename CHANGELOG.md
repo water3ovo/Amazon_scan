@@ -1,3 +1,12 @@
+## 2.0.0-beta.5.2 - 2026-09-04
+
+- 修复库存字段误抓 Amazon AOD 内联脚本（`P.when(...aod-assets-loaded...)`）的问题：库存仅读取可见文本，并对脚本特征做拒绝过滤。
+- 保持 `购买框状态=NO_BUYBOX` 大类不变，同时在内部区分购买框丢失原因。
+- 识别 `Price higher than typical` / `Low price standards not met`，异常标注显示为 `buy box丢失（价格高于典型价格）`。
+- 识别 `No featured offers available` / `See all buying options`，异常标注显示为 `buy box丢失（无Featured Offer）`。
+- 缺货导致无购买框时仍保持 `buy box丢失；缺货`，避免与价格抑制、无 Featured Offer 混为同一原因。
+- 新增 parser 回归测试 CI，覆盖库存脚本过滤、BuyBox 原因分类、第三方 Seller 和原有购买框状态逻辑。
+
 ## 2.0.0-beta.5 - 2026-09-03
 
 - 新增 Google Sheets API 自动读写模式：默认从线上 `Mapping` 直接读取扫查目标，不再要求每天复制本地 input。
