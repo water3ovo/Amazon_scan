@@ -3,7 +3,7 @@ from datetime import date
 from src.amazon_parser import AmazonParser
 from src.anomaly import build_anomaly
 from src.models import ProductSnapshot, ScanTarget
-from src.parser_fixes import _is_valid_stock_text, classify_purchase_box_reason
+from src.parser_fixes import _is_valid_stock_text, _strict_stock_status, classify_purchase_box_reason
 from src.utils import delivery_over_10_days, extract_asin, normalize_stock, parse_price_value
 
 
@@ -27,6 +27,14 @@ def test_stock_javascript_is_rejected():
     assert not _is_valid_stock_text(junk)
     assert _is_valid_stock_text("Only 1 left in stock (more on the way).")
     assert _is_valid_stock_text("Temporarily out of stock. Order now and we'll deliver when available.")
+
+
+def test_strict_stock_does_not_treat_generic_only_as_low_stock():
+    copy = "USA MARKET ONLY WORK ON TMOBILE MINT TELLO OR ANY UNDER TMOBILE NETWORK"
+    assert _strict_stock_status(copy) == "UNKNOWN"
+    assert not _is_valid_stock_text(copy)
+    assert _strict_stock_status("Only 1 left in stock - order soon.") == "LOW_STOCK"
+    assert _strict_stock_status("Only 3 left in stock (more on the way).") == "LOW_STOCK"
 
 
 def test_delivery():
