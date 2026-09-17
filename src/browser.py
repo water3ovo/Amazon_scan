@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import random
+import re
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -9,10 +12,21 @@ from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from .utils import clean_text, safe_filename
+
+
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)\.(\d+)")
+
+
+def _version_tuple(text: str) -> tuple[int, int, int, int] | None:
+    match = _VERSION_RE.search(text or "")
+    if not match:
+        return None
+    return tuple(int(x) for x in match.groups())
 
 
 class BrowserSession:
@@ -29,6 +43,108 @@ class BrowserSession:
         self.headless = configured_headless if headless is None else bool(headless)
         self.driver = None
         self.navigation_count = 0
+
+    def _find_chrome_binary(self) -> Path | None:
+        configured = os.environ.get("CHROME_BINARY", "").strip()
+        if configured:
+            path = Path(configured)
+            if path.exists():
+                return path
+
+        which = shutil.which("chrome") or shutil.which("chrome.exe")
+        if which:
+            return Path(which)
+
+        candidates = []
+        for env_name in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            root = os.environ.get(env_name, "").strip()
+            if root:
+                candidates.append(Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe")
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _detect_chrome_version(self, chrome_binary: Path) -> tuple[int, int, int, int] | None:
+        try:
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            completed = subprocess.run(
+                [str(chrome_binary), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=creationflags,
+            )
+            combined = f"{completed.stdout} {completed.stderr}"
+            parsed = _version_tuple(combined)
+            if parsed:
+                return parsed
+        except Exception:
+            pass
+
+        try:
+            application_dir = chrome_binary.parent
+            versions = []
+            for child in application_dir.iterdir():
+                if child.is_dir():
+                    parsed = _version_tuple(child.name)
+                    if parsed:
+                        versions.append(parsed)
+            if versions:
+                return max(versions)
+        except Exception:
+            pass
+        return None
+
+    def _find_cached_driver(self, chrome_version: tuple[int, int, int, int] | None) -> Path | None:
+        userprofile = os.environ.get("USERPROFILE", "").strip()
+        if not userprofile:
+            return None
+        cache_root = Path(userprofile) / ".cache" / "selenium" / "chromedriver" / "win64"
+        if not cache_root.exists():
+            return None
+
+        candidates: list[tuple[tuple[int, int, int, int], Path]] = []
+        for driver in cache_root.glob("*/chromedriver.exe"):
+            version = _version_tuple(driver.parent.name)
+            if version:
+                candidates.append((version, driver))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        if chrome_version:
+            major = chrome_version[0]
+            same_major = [item for item in candidates if item[0][0] == major]
+            if same_major:
+                return same_major[0][1]
+            return None
+
+        return candidates[0][1]
+
+    def _build_service(self, chrome_binary: Path | None) -> Service:
+        chrome_version = self._detect_chrome_version(chrome_binary) if chrome_binary else None
+        version_text = ".".join(str(x) for x in chrome_version) if chrome_version else "未知"
+        print(f"[Browser] Chrome: {chrome_binary or '未识别到路径'} | 版本: {version_text}")
+
+        driver = self._find_cached_driver(chrome_version)
+        if not driver:
+            userprofile = os.environ.get("USERPROFILE", "%USERPROFILE%")
+            cache_hint = Path(userprofile) / ".cache" / "selenium" / "chromedriver" / "win64"
+            if chrome_version:
+                raise RuntimeError(
+                    f"未找到与 Chrome {chrome_version[0]} 主版本匹配的本地 ChromeDriver。"
+                    f" 当前缓存目录: {cache_hint}"
+                )
+            raise RuntimeError(
+                f"无法识别 Chrome 版本，且无法安全选择缓存 ChromeDriver。当前缓存目录: {cache_hint}"
+            )
+
+        print(f"[Browser] 使用本地缓存 ChromeDriver: {driver}")
+        return Service(executable_path=str(driver))
 
     def start(self):
         options = Options()
@@ -53,12 +169,17 @@ class BrowserSession:
         if self.headless:
             options.add_argument("--headless=new")
 
-        chrome_binary = os.environ.get("CHROME_BINARY", "").strip()
+        print(f"[Browser] 正在准备 {self.country} Chrome Profile...")
+        chrome_binary = self._find_chrome_binary()
         if chrome_binary:
-            options.binary_location = chrome_binary
+            options.binary_location = str(chrome_binary)
 
-        # Selenium Manager automatically resolves a compatible ChromeDriver.
-        self.driver = webdriver.Chrome(options=options)
+        service = self._build_service(chrome_binary)
+
+        print(f"[Browser] 正在启动 {self.country} Chrome...")
+        self.driver = webdriver.Chrome(service=service, options=options)
+        print(f"[Browser] {self.country} Chrome 启动成功。")
+
         timeout = int(self.settings.get("browser", {}).get("page_load_timeout_seconds", 25))
         self.driver.set_page_load_timeout(timeout)
         try:
@@ -97,12 +218,10 @@ class BrowserSession:
             if self.navigation_count == 0:
                 self.driver.get(url)
             else:
-                # Preserve a same-session referrer path; this was more stable than repeated address-bar navigation in V1.
                 self.driver.execute_script("window.location.href = arguments[0];", url)
             self.navigation_count += 1
             self._wait_body()
         except TimeoutException:
-            # Amazon can finish rendering useful product content after Selenium's page timeout.
             try:
                 self.driver.execute_script("window.stop();")
             except Exception:
