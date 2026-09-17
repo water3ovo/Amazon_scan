@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import date
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote
 
 from .models import ScanResult, ScanTarget
 from .utils import clean_text, extract_asin
@@ -64,6 +66,8 @@ def _normalize_date(value) -> str:
 
 
 class GoogleSheetsClient:
+    API_BASE = "https://sheets.googleapis.com/v4/spreadsheets"
+
     def __init__(self, base_dir: Path, config_path: Path):
         self.base_dir = Path(base_dir)
         self.config_path = Path(config_path)
@@ -71,7 +75,7 @@ class GoogleSheetsClient:
         self.http_timeout = max(30, int(self.config.get("http_timeout_seconds", 120)))
         self.api_retries = max(0, int(self.config.get("api_retries", 4)))
         self.credentials = None
-        self.service = self._build_service()
+        self.session = self._build_session()
 
     def _load_config(self) -> dict:
         if not self.config_path.exists():
@@ -82,12 +86,10 @@ class GoogleSheetsClient:
             raise GoogleSheetsError("config/google_sheets.json 缺少 spreadsheet_id。")
         return cfg
 
-    def _build_service(self):
+    def _build_session(self):
         try:
-            import httplib2
             from google.oauth2.service_account import Credentials
-            from google_auth_httplib2 import AuthorizedHttp
-            from googleapiclient.discovery import build
+            from google.auth.transport.requests import AuthorizedSession
         except ImportError as exc:
             raise GoogleSheetsError(
                 "缺少 Google API 依赖。请先运行‘升级V5依赖.bat’，或执行 pip install -r requirements.txt。"
@@ -107,18 +109,39 @@ class GoogleSheetsClient:
             str(credentials_path),
             scopes=["https://www.googleapis.com/auth/spreadsheets"],
         )
-        http = httplib2.Http(timeout=self.http_timeout)
-        authorized_http = AuthorizedHttp(self.credentials, http=http)
-        return build(
-            "sheets",
-            "v4",
-            http=authorized_http,
-            cache_discovery=False,
-        )
+        return AuthorizedSession(self.credentials)
 
     @property
     def spreadsheet_id(self) -> str:
         return self.config["spreadsheet_id"]
+
+    def _request(self, method: str, url: str, *, params=None, json_body=None):
+        last_exc = None
+        for attempt in range(self.api_retries + 1):
+            try:
+                response = self.session.request(
+                    method,
+                    url,
+                    params=params,
+                    json=json_body,
+                    timeout=(20, self.http_timeout),
+                )
+                if response.status_code not in {429, 500, 502, 503, 504}:
+                    response.raise_for_status()
+                    return response
+                last_exc = GoogleSheetsError(
+                    f"Google API 暂时不可用: HTTP {response.status_code}: {response.text[:300]}"
+                )
+            except Exception as exc:
+                last_exc = exc
+
+            if attempt < self.api_retries:
+                time.sleep(min(2 ** attempt, 8))
+
+        raise GoogleSheetsError(
+            f"Google API 请求失败，已重试 {self.api_retries} 次。"
+            f" 原始错误: {type(last_exc).__name__}: {last_exc}"
+        ) from last_exc
 
     def test_connection(self) -> dict:
         try:
@@ -134,10 +157,13 @@ class GoogleSheetsClient:
 
         try:
             print("[Google 2/2] 正在读取目标 Google Sheet...")
-            meta = self.service.spreadsheets().get(
-                spreadsheetId=self.spreadsheet_id,
-                fields="properties.title,sheets.properties.title",
-            ).execute(num_retries=self.api_retries)
+            url = f"{self.API_BASE}/{self.spreadsheet_id}"
+            response = self._request(
+                "GET",
+                url,
+                params={"fields": "properties.title,sheets.properties.title"},
+            )
+            meta = response.json()
             print("[Google 2/2] Google Sheet 读取成功。")
         except Exception as exc:
             raise GoogleSheetsError(
@@ -150,16 +176,21 @@ class GoogleSheetsClient:
             "sheets": [x.get("properties", {}).get("title", "") for x in meta.get("sheets", [])],
         }
 
+    def _get_values(self, range_name: str) -> list[list]:
+        encoded_range = quote(range_name, safe="")
+        url = f"{self.API_BASE}/{self.spreadsheet_id}/values/{encoded_range}"
+        response = self._request(
+            "GET",
+            url,
+            params={"valueRenderOption": "FORMATTED_VALUE"},
+        )
+        return response.json().get("values", [])
+
     def load_targets(self, filter_active_products: bool = True) -> list[ScanTarget]:
         sheet = self.config.get("mapping_sheet", "Mapping")
         mapping_range = self.config.get("mapping_range", "A:J")
         range_name = f"{_quote_sheet(sheet)}!{mapping_range}"
-        response = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=range_name,
-            valueRenderOption="FORMATTED_VALUE",
-        ).execute(num_retries=self.api_retries)
-        values = response.get("values", [])
+        values = self._get_values(range_name)
         if not values:
             raise GoogleSheetsError(f"Google Sheet 的 {sheet} 没有数据。")
 
@@ -175,6 +206,7 @@ class GoogleSheetsClient:
             return clean_text(row[i]) if i is not None and i < len(row) else ""
 
         merged: dict[tuple[str, str], ScanTarget] = {}
+        active_values_lower = {x.lower() for x in ACTIVE_VALUES}
         for row in values[1:]:
             country = val(row, "国家").upper()
             url = val(row, "URL")
@@ -184,7 +216,7 @@ class GoogleSheetsClient:
             product_type = val(row, "类型") or "本品"
             active_status = val(row, "在投状态")
             if filter_active_products and product_type == "本品":
-                if active_status.strip().lower() not in {x.lower() for x in ACTIVE_VALUES}:
+                if active_status.strip().lower() not in active_values_lower:
                     continue
             target = ScanTarget(
                 country=country,
@@ -205,12 +237,7 @@ class GoogleSheetsClient:
 
     def _existing_rows(self, sheet: str, last_col: str, max_rows: int) -> tuple[dict[tuple[str, str, str], int], list[int]]:
         range_name = f"{_quote_sheet(sheet)}!A2:{last_col}{max_rows}"
-        response = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=range_name,
-            valueRenderOption="FORMATTED_VALUE",
-        ).execute(num_retries=self.api_retries)
-        values = response.get("values", [])
+        values = self._get_values(range_name)
         keys: dict[tuple[str, str, str], int] = {}
         free_rows: list[int] = []
         for offset in range(max_rows - 1):
@@ -252,12 +279,14 @@ class GoogleSheetsClient:
                 "values": [row],
             })
 
+        batch_url = f"{self.API_BASE}/{self.spreadsheet_id}/values:batchUpdate"
         for start in range(0, len(updates), 200):
             chunk = updates[start:start + 200]
-            self.service.spreadsheets().values().batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body={"valueInputOption": "USER_ENTERED", "data": chunk},
-            ).execute(num_retries=self.api_retries)
+            self._request(
+                "POST",
+                batch_url,
+                json_body={"valueInputOption": "USER_ENTERED", "data": chunk},
+            )
         return {"updated": updated, "inserted": inserted}
 
     def upsert_results(self, results: list[ScanResult]) -> dict:
