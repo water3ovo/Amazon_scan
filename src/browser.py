@@ -12,7 +12,7 @@ from pathlib import Path
 
 import requests
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import SessionNotCreatedException, TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -23,6 +23,10 @@ from .utils import clean_text, safe_filename
 
 
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)\.(\d+)")
+_CURRENT_BROWSER_RE = re.compile(
+    r"Current browser version is\s+(\d+\.\d+\.\d+\.\d+)",
+    re.IGNORECASE,
+)
 
 
 def _version_tuple(text: str) -> tuple[int, int, int, int] | None:
@@ -70,18 +74,9 @@ class BrowserSession:
         return None
 
     def _detect_chrome_version(self, chrome_binary: Path) -> tuple[int, int, int, int] | None:
-        try:
-            versions = []
-            for child in chrome_binary.parent.iterdir():
-                if child.is_dir():
-                    parsed = _version_tuple(child.name)
-                    if parsed:
-                        versions.append(parsed)
-            if versions:
-                return max(versions)
-        except Exception:
-            pass
-
+        # IMPORTANT: read chrome.exe's real ProductVersion first.
+        # Chrome may already contain a staged next-version folder while the executable
+        # that Windows actually launches is still the previous version.
         try:
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             escaped = str(chrome_binary).replace("'", "''")
@@ -103,6 +98,19 @@ class BrowserSession:
                 return parsed
         except Exception:
             pass
+
+        # Fallback only: inspect version directories.
+        try:
+            versions = []
+            for child in chrome_binary.parent.iterdir():
+                if child.is_dir():
+                    parsed = _version_tuple(child.name)
+                    if parsed:
+                        versions.append(parsed)
+            if versions:
+                return max(versions)
+        except Exception:
+            pass
         return None
 
     def _cache_root(self) -> Path:
@@ -111,7 +119,7 @@ class BrowserSession:
             raise RuntimeError("无法读取 USERPROFILE，无法定位 Selenium ChromeDriver 缓存。")
         return Path(userprofile) / ".cache" / "selenium" / "chromedriver" / "win64"
 
-    def _find_cached_driver(self, chrome_version: tuple[int, int, int, int] | None) -> Path | None:
+    def _find_cached_driver(self, chrome_version: tuple[int, int, int, int]) -> Path | None:
         cache_root = self._cache_root()
         if not cache_root.exists():
             return None
@@ -126,13 +134,8 @@ class BrowserSession:
             return None
 
         candidates.sort(key=lambda item: item[0], reverse=True)
-        if chrome_version:
-            same_major = [item for item in candidates if item[0][0] == chrome_version[0]]
-            if same_major:
-                return same_major[0][1]
-            return None
-
-        return candidates[0][1]
+        same_major = [item for item in candidates if item[0][0] == chrome_version[0]]
+        return same_major[0][1] if same_major else None
 
     def _download_driver(self, chrome_version: tuple[int, int, int, int]) -> Path:
         version_text = ".".join(str(x) for x in chrome_version)
@@ -145,8 +148,8 @@ class BrowserSession:
             "https://storage.googleapis.com/chrome-for-testing-public/"
             f"{version_text}/win64/chromedriver-win64.zip"
         )
-
         print(f"[Browser] 本机没有 Chrome {chrome_version[0]} driver，正在下载 {version_text}...")
+
         try:
             response = requests.get(url, timeout=(15, 120))
             response.raise_for_status()
@@ -172,23 +175,17 @@ class BrowserSession:
         print(f"[Browser] ChromeDriver 已缓存: {driver_path}")
         return driver_path
 
-    def _build_service(self, chrome_binary: Path | None) -> Service:
-        chrome_version = self._detect_chrome_version(chrome_binary) if chrome_binary else None
-        version_text = ".".join(str(x) for x in chrome_version) if chrome_version else "未知"
-        print(f"[Browser] Chrome: {chrome_binary or '未识别到路径'} | 版本: {version_text}")
+    def _driver_for_version(self, chrome_version: tuple[int, int, int, int]) -> Path:
+        cached = self._find_cached_driver(chrome_version)
+        if cached:
+            print(f"[Browser] 使用本地缓存 ChromeDriver: {cached}")
+            return cached
+        return self._download_driver(chrome_version)
 
-        if not chrome_version:
-            raise RuntimeError("无法识别本机 Chrome 版本，已停止，避免使用错误的 ChromeDriver。")
+    def _make_service(self, chrome_version: tuple[int, int, int, int]) -> Service:
+        return Service(executable_path=str(self._driver_for_version(chrome_version)))
 
-        driver = self._find_cached_driver(chrome_version)
-        if driver:
-            print(f"[Browser] 使用本地缓存 ChromeDriver: {driver}")
-        else:
-            driver = self._download_driver(chrome_version)
-
-        return Service(executable_path=str(driver))
-
-    def start(self):
+    def _build_options(self, chrome_binary: Path | None) -> Options:
         options = Options()
         options.page_load_strategy = "eager"
         options.add_argument(f"--user-data-dir={self.profile_dir.resolve()}")
@@ -210,16 +207,49 @@ class BrowserSession:
         )
         if self.headless:
             options.add_argument("--headless=new")
-
-        print(f"[Browser] 正在准备 {self.country} Chrome Profile...")
-        chrome_binary = self._find_chrome_binary()
         if chrome_binary:
             options.binary_location = str(chrome_binary)
+        return options
 
-        service = self._build_service(chrome_binary)
+    def start(self):
+        print(f"[Browser] 正在准备 {self.country} Chrome Profile...")
+        chrome_binary = self._find_chrome_binary()
+        if not chrome_binary:
+            raise RuntimeError("未找到本机 Google Chrome。")
+
+        chrome_version = self._detect_chrome_version(chrome_binary)
+        if not chrome_version:
+            raise RuntimeError("无法读取 chrome.exe 实际版本。")
+
+        detected_text = ".".join(str(x) for x in chrome_version)
+        print(f"[Browser] Chrome: {chrome_binary} | 实际版本: {detected_text}")
+
+        options = self._build_options(chrome_binary)
+        service = self._make_service(chrome_version)
 
         print(f"[Browser] 正在启动 {self.country} Chrome...")
-        self.driver = webdriver.Chrome(service=service, options=options)
+        try:
+            self.driver = webdriver.Chrome(service=service, options=options)
+        except SessionNotCreatedException as exc:
+            message = str(exc)
+            current = _CURRENT_BROWSER_RE.search(message)
+            if not current:
+                raise
+
+            actual_version = _version_tuple(current.group(1))
+            if not actual_version or actual_version[0] == chrome_version[0]:
+                raise
+
+            actual_text = ".".join(str(x) for x in actual_version)
+            print(
+                f"[Browser] 驱动版本判断与 Chrome 实际运行版本不一致："
+                f"{detected_text} -> {actual_text}，自动切换后重试..."
+            )
+
+            retry_service = self._make_service(actual_version)
+            retry_options = self._build_options(chrome_binary)
+            self.driver = webdriver.Chrome(service=retry_service, options=retry_options)
+
         print(f"[Browser] {self.country} Chrome 启动成功。")
 
         timeout = int(self.settings.get("browser", {}).get("page_load_timeout_seconds", 25))
